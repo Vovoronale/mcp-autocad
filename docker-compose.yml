@@ -1,0 +1,7 @@
+services:
+  mcp-autocad:
+    build: .
+    environment:
+      - BRIDGE_URL=http://host.docker.internal:8765
+    stdin_open: true
+    tty: false
