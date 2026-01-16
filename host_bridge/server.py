@@ -38,37 +38,171 @@ def _ensure_layer(doc, name):
         return doc.Layers.Add(name)
 
 
+def _normalize_point(values, *, name="point"):
+    if not isinstance(values, list):
+        raise ValueError(f"{name} must be a list.")
+    if len(values) not in (2, 3):
+        raise ValueError(f"{name} must be [x, y] or [x, y, z].")
+    if len(values) == 2:
+        values = [values[0], values[1], 0.0]
+    return [float(v) for v in values]
+
+
+def _apply_entity_props(doc, entity, payload):
+    layer = payload.get("layer")
+    if layer:
+        _ensure_layer(doc, layer)
+        entity.Layer = layer
+
+    color = payload.get("color")
+    if color is not None:
+        entity.Color = int(color)
+
+
 def _draw_line(payload):
-    start = payload.get("start")
-    end = payload.get("end")
-    if not isinstance(start, list) or not isinstance(end, list):
-        raise ValueError("start and end must be lists.")
-    if len(start) not in (2, 3) or len(end) not in (2, 3):
-        raise ValueError("start and end must be [x, y] or [x, y, z].")
-    if len(start) == 2:
-        start = [start[0], start[1], 0.0]
-    if len(end) == 2:
-        end = [end[0], end[1], 0.0]
-    start = [float(v) for v in start]
-    end = [float(v) for v in end]
+    start = _normalize_point(payload.get("start"), name="start")
+    end = _normalize_point(payload.get("end"), name="end")
 
     app = _get_app()
     doc = _ensure_doc(app)
     model_space = doc.ModelSpace
 
     line = model_space.AddLine(_to_variant_point(start), _to_variant_point(end))
-
-    layer = payload.get("layer")
-    if layer:
-        _ensure_layer(doc, layer)
-        line.Layer = layer
-
-    color = payload.get("color")
-    if color is not None:
-        line.Color = int(color)
+    _apply_entity_props(doc, line, payload)
 
     doc.Regen(0)
     return {"handle": line.Handle}
+
+
+def _draw_circle(payload):
+    center = _normalize_point(payload.get("center"), name="center")
+    radius = payload.get("radius")
+    if radius is None:
+        raise ValueError("radius is required.")
+    radius = float(radius)
+
+    app = _get_app()
+    doc = _ensure_doc(app)
+    model_space = doc.ModelSpace
+
+    circle = model_space.AddCircle(_to_variant_point(center), radius)
+    _apply_entity_props(doc, circle, payload)
+
+    doc.Regen(0)
+    return {"handle": circle.Handle}
+
+
+def _draw_rectangle(payload):
+    corner1 = _normalize_point(payload.get("corner1"), name="corner1")
+    corner2 = _normalize_point(payload.get("corner2"), name="corner2")
+
+    x1, y1, z1 = corner1
+    x2, y2, z2 = corner2
+    z = z1 if abs(z1 - z2) < 1e-9 else z1
+
+    points = [
+        [x1, y1, z],
+        [x2, y1, z],
+        [x2, y2, z],
+        [x1, y2, z],
+    ]
+    payload = dict(payload)
+    payload["points"] = points
+    payload["closed"] = True
+    return _draw_polyline(payload)
+
+
+def _flatten_points(points):
+    flat = []
+    for pt in points:
+        flat.extend(pt)
+    return flat
+
+
+def _draw_polyline(payload):
+    points = payload.get("points")
+    if not isinstance(points, list) or len(points) < 2:
+        raise ValueError("points must be a list with at least 2 points.")
+    normalized = [_normalize_point(p, name="point") for p in points]
+
+    app = _get_app()
+    doc = _ensure_doc(app)
+    model_space = doc.ModelSpace
+
+    has_z = any(abs(pt[2]) > 1e-9 for pt in normalized)
+    polyline = None
+    if has_z and hasattr(model_space, "Add3DPoly"):
+        polyline = model_space.Add3DPoly(_to_variant_point(_flatten_points(normalized)))
+    else:
+        flat_2d = []
+        for pt in normalized:
+            flat_2d.extend([pt[0], pt[1]])
+        polyline = model_space.AddLightWeightPolyline(_to_variant_point(flat_2d))
+
+    if payload.get("closed"):
+        try:
+            polyline.Closed = True
+        except Exception:
+            pass
+
+    _apply_entity_props(doc, polyline, payload)
+
+    doc.Regen(0)
+    return {"handle": polyline.Handle}
+
+
+def _get_entities_by_handles(doc, payload):
+    handles = payload.get("handles")
+    if handles is None:
+        handle = payload.get("handle")
+        if handle is not None:
+            handles = [handle]
+    if not isinstance(handles, list) or not handles:
+        raise ValueError("handles must be a non-empty list.")
+    entities = []
+    for handle in handles:
+        if not isinstance(handle, str):
+            raise ValueError("handle must be a string.")
+        entities.append(doc.HandleToObject(handle))
+    return entities
+
+
+def _get_move_points(payload):
+    if "delta" in payload:
+        delta = _normalize_point(payload.get("delta"), name="delta")
+        return [0.0, 0.0, 0.0], delta
+    from_pt = _normalize_point(payload.get("from"), name="from")
+    to_pt = _normalize_point(payload.get("to"), name="to")
+    return from_pt, to_pt
+
+
+def _copy_entities(payload):
+    app = _get_app()
+    doc = _ensure_doc(app)
+    entities = _get_entities_by_handles(doc, payload)
+    from_pt, to_pt = _get_move_points(payload)
+
+    new_handles = []
+    for ent in entities:
+        new_ent = ent.Copy()
+        new_ent.Move(_to_variant_point(from_pt), _to_variant_point(to_pt))
+        new_handles.append(new_ent.Handle)
+
+    doc.Regen(0)
+    return {"handles": new_handles}
+
+
+def _move_entities(payload):
+    app = _get_app()
+    doc = _ensure_doc(app)
+    entities = _get_entities_by_handles(doc, payload)
+    from_pt, to_pt = _get_move_points(payload)
+
+    for ent in entities:
+        ent.Move(_to_variant_point(from_pt), _to_variant_point(to_pt))
+
+    doc.Regen(0)
+    return {"handles": [ent.Handle for ent in entities]}
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -87,14 +221,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/draw-line":
+        routes = {
+            "/draw-line": _draw_line,
+            "/draw-circle": _draw_circle,
+            "/draw-rectangle": _draw_rectangle,
+            "/draw-polyline": _draw_polyline,
+            "/copy-entities": _copy_entities,
+            "/move-entities": _move_entities,
+        }
+        if self.path not in routes:
             self._send_json(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         try:
             payload = json.loads(body) if body else {}
-            result = _draw_line(payload)
+            result = routes[self.path](payload)
         except Exception as exc:
             self._send_json(500, {"error": str(exc)})
             return
